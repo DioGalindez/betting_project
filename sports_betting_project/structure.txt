@@ -1,0 +1,250 @@
+.
+├── /config/
+│   ├── __init__.py 
+│   └── settings.py
+│ 
+├── /data/             # Datos brutos (CSV/JSON de partidos, odds)
+│   │   ├── partidos.csv
+│   │   └── odds.csv
+│
+├── /scripts/
+│   │   ├── download_data.py
+│   │   └── get_odds.py
+│   
+├── utils.py    # Funciones auxiliares
+│       
+│
+└── README.md   # Documentación
+
+
+
+
+import json
+import pandas as pd
+from typing import List, Dict
+from datetime import datetime, timedelta
+import pytz
+from utils import (
+    normalize_team_name,
+    filter_duplicate_bets
+)
+from config.settings import BOOKMAKERS, MIN_EDGE
+
+def load_data():
+    """Carga robusta con validación de estructura"""
+    try:
+        with open('data/odds.json') as f:
+            odds_data = json.load(f)
+        
+        league_data = pd.read_csv('data/la_liga_2024_matches.csv')
+        
+        # Conversión segura de fechas
+        league_data['date'] = pd.to_datetime(league_data['date'], errors='coerce')
+        league_data = league_data.dropna(subset=['date'])
+        
+        # Validación de datos mínimos
+        if len(league_data) == 0:
+            raise ValueError("Datos históricos están vacíos")
+            
+        return odds_data, league_data
+    
+    except Exception as e:
+        print(f"❌ Error cargando datos: {str(e)}")
+        raise
+
+def get_recent_matches(league_data: pd.DataFrame, days: int = 180) -> pd.DataFrame:
+    """Filtra partidos recientes con protección completa"""
+    try:
+        cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days)
+        recent = league_data[league_data['date'] > cutoff_date]
+        
+        # Si no hay partidos recientes, usar todos los disponibles
+        if len(recent) == 0:
+            print("⚠️ Usando todos los partidos históricos (no hay recientes)")
+            return league_data.copy()
+            
+        return recent
+    except Exception as e:
+        print(f"⚠️ Error filtrando partidos recientes: {str(e)}")
+        return league_data.copy()
+
+def calculate_team_performance(team: str, matches: pd.DataFrame, is_home: bool) -> tuple:
+    """Cálculo completamente protegido contra divisiones por cero"""
+    try:
+        if len(matches) == 0:
+            return (1.0, 1.0)  # Valores neutros seguros
+        
+        if is_home:
+            team_matches = matches[matches['home_team'] == team]
+            scored = team_matches['home_score'].mean() if not team_matches.empty else 1.0
+            conceded = team_matches['away_score'].mean() if not team_matches.empty else 1.0
+        else:
+            team_matches = matches[matches['away_team'] == team]
+            scored = team_matches['away_score'].mean() if not team_matches.empty else 1.0
+            conceded = team_matches['home_score'].mean() if not team_matches.empty else 1.0
+        
+        # Valores mínimos y máximos razonables
+        return (
+            max(min(scored, 4.0), 0.5),  # Entre 0.5 y 4 goles
+            max(min(conceded, 4.0), 0.5)
+        )
+    except Exception as e:
+        print(f"⚠️ Error en cálculo para {team}: {str(e)}")
+        return (1.0, 1.0)
+
+def calculate_probabilities(home_team: str, away_team: str, league_data: pd.DataFrame) -> Dict[str, float]:
+    """Cálculo de probabilidades 100% protegido"""
+    try:
+        recent_matches = get_recent_matches(league_data)
+        
+        # Si no hay datos para estos equipos específicos
+        team_matches = recent_matches[
+            (recent_matches['home_team'] == home_team) | 
+            (recent_matches['away_team'] == home_team) |
+            (recent_matches['home_team'] == away_team) | 
+            (recent_matches['away_team'] == away_team)
+        ]
+        
+        if len(team_matches) == 0:
+            print(f"⚠️ No hay datos recientes para {home_team} o {away_team}")
+            return {
+                home_team: 0.35,
+                away_team: 0.35,
+                'draw': 0.30
+            }
+        
+        home_scored, home_conceded = calculate_team_performance(home_team, recent_matches, True)
+        away_scored, away_conceded = calculate_team_performance(away_team, recent_matches, False)
+        
+        # Fuerza relativa con suavizado
+        home_str = (home_scored * away_conceded + 1) ** 0.5
+        away_str = (away_scored * home_conceded + 1) ** 0.5
+        
+        total = home_str + away_str + 1.2  # 1.2 = peso base para empates
+        
+        return {
+            home_team: max(min(home_str / total, 0.7), 0.25),
+            away_team: max(min(away_str / total, 0.7), 0.25),
+            'draw': max(min(1.2 / total, 0.5), 0.1)
+        }
+    except Exception as e:
+        print(f"⚠️ Fallback en {home_team} vs {away_team}: {str(e)}")
+        return {
+            home_team: 0.35,
+            away_team: 0.35,
+            'draw': 0.30
+        }
+
+def find_value_bets(odds_data: List[Dict], league_data: pd.DataFrame) -> List[Dict]:
+    """Búsqueda principal con manejo completo de errores"""
+    value_bets = []
+    
+    for match in odds_data:
+        try:
+            home_team = normalize_team_name(match['home_team'])
+            away_team = normalize_team_name(match['away_team'])
+            
+            probs = calculate_probabilities(home_team, away_team, league_data)
+            
+            for bookmaker in match['bookmakers']:
+                if bookmaker['title'] not in BOOKMAKERS:
+                    continue
+                
+                h2h_market = next(
+                    (m for m in bookmaker['markets'] if m['key'] == 'h2h'),
+                    None
+                )
+                
+                if not h2h_market:
+                    continue
+                    
+                for outcome in h2h_market['outcomes']:
+                    process_outcome(outcome, home_team, away_team, probs, bookmaker['title'], value_bets)
+                    
+        except Exception as e:
+            print(f"⚠️ Error procesando partido: {str(e)}")
+            continue
+            
+    return value_bets
+
+def process_outcome(outcome: Dict, home_team: str, away_team: str, probs: Dict, bookmaker: str, value_bets: List):
+    """Procesamiento individual protegido"""
+    try:
+        team_name = normalize_team_name(outcome['name'])
+        odds = outcome.get('price', 0)
+        
+        if odds <= 1:
+            return
+            
+        implied_prob = 1 / odds
+        real_prob = probs.get(team_name, 0)
+        edge = real_prob - implied_prob
+        MIN_PROBABILITY_THRESHOLD = 0.40  # for example, only suggest bets with ≥40% real win chance
+
+        if edge > MIN_EDGE and real_prob >= MIN_PROBABILITY_THRESHOLD:
+            value_bets.append({
+                'match': f"{home_team} vs {away_team}",
+                'team': team_name,
+                'bookmaker': bookmaker,
+                'odds': odds,
+                'edge': round(edge, 4),
+                'implied_prob': round(implied_prob, 4),
+                'real_prob': round(real_prob, 4)
+            })
+    except Exception as e:
+        print(f"⚠️ Error procesando apuesta: {str(e)}")
+
+if __name__ == "__main__":
+    try:
+        print("⏳ Cargando y validando datos...")
+        odds_data, league_data = load_data()
+        
+        print(f"\n🔍 Analizando {len(odds_data)} partidos...")
+        value_bets = find_value_bets(odds_data, league_data)
+        final_bets = filter_duplicate_bets(value_bets)
+        
+        if not final_bets:
+            print("\n⚠️ No se encontraron value bets")
+            
+            # Diagnóstico avanzado
+            sample_match = next((m for m in odds_data if m.get('bookmakers')), None)
+            if sample_match:
+                home = normalize_team_name(sample_match['home_team'])
+                away = normalize_team_name(sample_match['away_team'])
+                
+                print(f"\n🔹 Ejemplo completo para {home} vs {away}:")
+                
+                # 1. Verificar datos históricos
+                team_matches = league_data[
+                    (league_data['home_team'] == home) | 
+                    (league_data['away_team'] == home) |
+                    (league_data['home_team'] == away) | 
+                    (league_data['away_team'] == away)
+                ]
+                print(f"- Partidos históricos encontrados: {len(team_matches)}")
+                if len(team_matches) > 0:
+                    print(f"- Último partido: {team_matches['date'].max().date()}")
+                
+                # 2. Mostrar probabilidades
+                probs = calculate_probabilities(home, away, league_data)
+                print(f"- Probabilidades calculadas: {home} {probs[home]:.1%} | {away} {probs[away]:.1%} | Empate {probs['draw']:.1%}")
+                
+                # 3. Mostrar odds disponibles
+                print("\n📊 Mercados disponibles en bookmakers:")
+                for bookmaker in sample_match['bookmakers']:
+                    print(f"\n{bookmaker['title']}:")
+                    for market in bookmaker['markets']:
+                        print(f"- {market['key']}: {[o['name'] for o in market['outcomes']]}")
+            
+            print("\n💡 Acciones recomendadas:")
+            print("1. Verificar que los datos históricos contengan partidos recientes")
+            print("2. Comprobar que los nombres de equipos coincidan exactamente")
+            print(f"3. Reducir MIN_EDGE en config/settings.py (actual: {MIN_EDGE})")
+            print("4. Asegurarse que la API devuelva el mercado h2h")
+        else:
+            print(f"\n✅ {len(final_bets)} value bets encontradas!")
+            with open('data/value_bets.json', 'w') as f:
+                json.dump(final_bets, f, indent=2)
+                
+    except Exception as e:
+        print(f"❌ Error crítico: {str(e)}")
